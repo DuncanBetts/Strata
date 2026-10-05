@@ -508,8 +508,6 @@ int run_groupmask() {
     return fails;
 }
 
-}  // namespace
-
 // replay of captured production dn inputs (/tmp/cap0_dn_*.bin): stride vs
 // ptr + non-finite scan. Answers whether captured bytes decode finite.
 int run_dn_cap() {
@@ -585,6 +583,8 @@ int run_dn_cap() {
     ck(cudaStreamDestroy(cs), "sdestroy");
     return fails;
 }
+}  // namespace
+
 int main() {
     int dev = 0;
     if (cudaGetDeviceCount(&dev) != cudaSuccess || dev < 1) return 77;

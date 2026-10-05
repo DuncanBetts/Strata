@@ -105,6 +105,11 @@ inline int64_t stream_all_min() {
     static const int64_t v = [] { const char* e = std::getenv("STRATA_PREFILL_STREAM_MIN"); return e ? (int64_t) std::atoll(e) : (int64_t) 1024; }();
     return v;
 }
+// Pointer-list bypass gate (STRATA_PF_PTR_MMQ=1, default off), read once.
+inline bool ptr_bypass_on() {
+    static const bool v = [] { const char* e = std::getenv("STRATA_PF_PTR_MMQ"); return e != nullptr && std::atoi(e) != 0; }();
+    return v;
+}
 double g_pinned_share = 1.0;
 // The streamed ring: 384 slots when (nearly) every streamed expert is DMA'd from pinned RAM - measured on Q2_0,
 // 8192-token chunks: 96 slots 1153 tok/s, 384 1294 (the next layer's experts arrive during its attention half) -
@@ -2461,10 +2466,6 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             }
                             const size_t n = order_peer.size();
                             // Pointer-list bypass gate (default off; mirrors local path).
-                            static const bool ptr_env = [] {
-                                const char* v = std::getenv("STRATA_PF_PTR_MMQ");
-                                return v != nullptr && std::atoi(v) != 0;
-                            }();
                             if (P.compact) {
                                 // groups of up to MMQ_GROUP experts and at most G rows, each computed from its own rows
                                 P.groups.clear();
@@ -2498,7 +2499,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                 for (size_t g2 = 0; g2 < ng; ++g2) {
                                     const size_t j0 = P.groups[g2].first, j1 = P.groups[g2].second;
                                     const int ngx = (int) (j1 - j0);
-                                    const bool do_ptr = ptr_env && lay.native && mmq::ptr_supported(mmq_gt, mmq_dt) && ngx <= 16;
+                                    const bool do_ptr = ptr_bypass_on() && lay.native && mmq::ptr_supported(mmq_gt, mmq_dt) && ngx <= 16;
                                     const uint8_t* ptr_blob[MMQ_GROUP] = {};
                                     int psl_of[MMQ_GROUP]; // ptr-list, mixed resident/ring: ring slot per position (-1 peer-resident)
                                     int64_t maxr = 0;
@@ -2598,7 +2599,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                     pblob[q] = bd; // ptr-list: blob per group slot (both modes use it)
                                     const size_t j0p = j - q;
                                     const size_t ngxp = std::min<size_t>(MMQ_GROUP, n - j0p);
-                                    const bool do_ptr = ptr_env && lay.native && mmq::ptr_supported(mmq_gt, mmq_dt) && (int) ngxp <= 16;
+                                    const bool do_ptr = ptr_bypass_on() && lay.native && mmq::ptr_supported(mmq_gt, mmq_dt) && (int) ngxp <= 16;
                                     if (lay.native) {
                                         if (!do_ptr)
                                             mmq::gather_native(bd, bd + f.up_off, mmq_gub / 2, bd + f.down_off, mmq_db,
@@ -2612,7 +2613,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                     const int64_t r0 = P.bounds_host[j0], nr = P.bounds_host[j + 1] - r0;
                                     int64_t maxr = 0;
                                     for (size_t i = j0; i <= j; ++i) maxr = std::max<int64_t>(maxr, m.cnt[(size_t) order_peer[i]]);
-                                    const bool pdo = ptr_env && lay.native && mmq::ptr_supported(mmq_gt, mmq_dt) && ngx <= 16;
+                                    const bool pdo = ptr_bypass_on() && lay.native && mmq::ptr_supported(mmq_gt, mmq_dt) && ngx <= 16;
                                     cudaMemsetAsync(P.grp_gu + (size_t) ngx * mmq_gub, 0, MMQ_TAIL, ps);
                                     cudaMemsetAsync(P.grp_d + (size_t) ngx * mmq_db, 0, MMQ_TAIL, ps);
                                     mmq::Product gu;
@@ -2728,15 +2729,12 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         mmq::GatherGroup gg;
                         int gg_slots[MMQ_GROUP];
                         int gg_nslots = 0;   // ring slots gathered by the next flush
-                        // ptr-list: pointer-list bypass (STRATA_PF_PTR_MMQ=1, default off). Blob per group slot,
+                        // ptr-list bypass (STRATA_PF_PTR_MMQ=1, default off). Blob per group slot,
                         // deferred ring-slot release (slots free after the products consume the blobs, not the
-                        // gather), and do_ptr (this group skips gather; read by flush() below, set per group).
-                        static const bool ptr_env = [] {
-                            const char* v = std::getenv("STRATA_PF_PTR_MMQ");
-                            return v != nullptr && std::atoi(v) != 0;
-                        }();
+                        // gather), and do_ptr (this group reads gate/up via the table; down is always gathered).
+
                         const uint8_t* ptr_blob[MMQ_GROUP] = {};
-                        int slot_of[MMQ_GROUP]; // ptr-list: ring slot per group position (-1 resident); drives per-expert gather skip
+                        int slot_of[MMQ_GROUP]; // ptr-list: ring slot per group position (-1 resident); selects table vs gathered buffer
                         bool do_ptr = false;
                         auto flush = [&]() {
                             if (gg.n <= gg.first) return;
@@ -2796,13 +2794,13 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                     gg.n = (int) q + 1;
                                     if (slot >= 0) gg_slots[gg_nslots++] = slot;
                                     if (q + 1 < MMQ_GROUP && j + 1 < order.size()) return true;
-                                    do_ptr = ptr_env && lay.native && mmq::ptr_supported(mmq_gt, mmq_dt);
+                                    do_ptr = ptr_bypass_on() && lay.native && mmq::ptr_supported(mmq_gt, mmq_dt);
                                     flush();
                                     gg = mmq::GatherGroup{};
                                 } else if (lay.native) {
                                     const auto& f = lay.fmt[(size_t) l];
                                     const size_t ngx_f = (q + 1 < MMQ_GROUP && j + 1 < order.size()) ? MMQ_GROUP : q + 1;
-                                    do_ptr = ptr_env && mmq::ptr_supported(mmq_gt, mmq_dt) && (int) ngx_f <= 16;
+                                    do_ptr = ptr_bypass_on() && mmq::ptr_supported(mmq_gt, mmq_dt) && (int) ngx_f <= 16;
                                     if (!do_ptr || slot >= 0) // stride path or ring expert: full gather
                                     mmq::gather_native(blob_dev, blob_dev + f.up_off, mmq_gub / 2, blob_dev + f.down_off,
                                                        mmq_db, m.grp_gu + q * mmq_gub, m.grp_d + q * mmq_db, m.cs);

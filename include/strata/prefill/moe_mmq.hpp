@@ -45,13 +45,12 @@ struct Product {
     int64_t total_rows = 0, max_rows = 0;
     float* dst = nullptr;
     int64_t ld_dst = 0;
-    // pointer-list experts. When ptr_list, the
-    // launch reads expert e's blob from blobs[e] (+up_off/down_off selected
-    // by the caller per product) instead of w + e * expert_bytes. Stride
-    // path untouched when unset. blobs referenced, never owned.
+    // pointer-list experts. When ptr_list, the launch reads expert e's matrix
+    // from blobs[e] (+ w_off) instead of w + e * expert_bytes; the caller
+    // pre-selects the matrix (gate/up at the blob base, down pre-offset).
+    // Stride path untouched when unset. blobs referenced, never owned.
     const void* blobs[16] = {};   // == kGatherGroupMax (defined below); literal: Product precedes it
-    size_t up_off = 0, down_off = 0;
-    size_t w_off = 0; // matrix offset within each blob: 0 = gate/up pair, down_off = down (caller-selected)
+    size_t w_off = 0; // added to each blob base by the dispatch (0 in-tree: the caller pre-offsets)
     bool ptr_list = false;
 };
 /// ptr-list: whether a gu/down type pair can run the pointer-list path

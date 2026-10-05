@@ -11,6 +11,7 @@
 #include <cstdlib>
 
 namespace strata::prefill::mmq {
+void run_ptr(const Product& p, void* backend_ctx, void* d_ptrs, void* stream); // FORK Rank-1 (mmq_ptr_dispatch.cu)
 namespace {
 
 void ck(cudaError_t e, const char* what) {
@@ -33,6 +34,7 @@ __global__ void copy16_kernel(const uint4* __restrict__ a, int64_t na, const uin
 struct GroupArgs {
     const uint8_t* blob[kGatherGroupMax];
     int64_t up_off, down_off, gu_stride, d_stride;   // in uint4
+    uint16_t dn_only; // FORK Rank-1: bit q (absolute group position) = copy q's down half only
 };
 __global__ void copy16_group_kernel(GroupArgs ga, int first, int64_t na, int64_t nc, uint4* __restrict__ gu_dst,
                                     uint4* __restrict__ d_dst) {
@@ -41,8 +43,8 @@ __global__ void copy16_group_kernel(GroupArgs ga, int first, int64_t na, int64_t
     uint4* ab = gu_dst + (int64_t) q * ga.gu_stride;
     uint4* cd = d_dst + (int64_t) q * ga.d_stride;
     const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < na) ab[i] = src[i];
-    else if (i < 2 * na) ab[i] = src[ga.up_off + (i - na)];
+    if (i < na) { if (!((ga.dn_only >> q) & 1)) ab[i] = src[i]; }
+    else if (i < 2 * na) { if (!((ga.dn_only >> q) & 1)) ab[i] = src[ga.up_off + (i - na)]; }
     else if (i < 2 * na + nc) cd[i - 2 * na] = src[ga.down_off + (i - 2 * na)];
 }
 __global__ void copy1_kernel(const uint8_t* __restrict__ a, int64_t na, const uint8_t* __restrict__ b, int64_t nb,
@@ -170,8 +172,9 @@ Context::Context() {
     int dev = 0;
     cudaGetDevice(&dev);
     ctx_ = new ggml_backend_cuda_context(dev);
+    ck(cudaMalloc(&d_ptrs_, 16 * sizeof(void*)), "ptr table"); // FORK Rank-1: blob-pointer table for ptr_list
 }
-Context::~Context() { delete (ggml_backend_cuda_context*) ctx_; }
+Context::~Context() { delete (ggml_backend_cuda_context*) ctx_; if (d_ptrs_) cudaFree(d_ptrs_); } // FORK Rank-1
 
 void Context::run(const Product& p, void* stream) {
     if (p.n <= 0 || p.max_rows <= 0) return;
@@ -184,6 +187,10 @@ void Context::run(const Product& p, void* stream) {
                         p.max_rows, p.max_rows};
     auto& ctx = *(ggml_backend_cuda_context*) ctx_;
     const cudaStream_t s = (cudaStream_t) stream;
+    if (p.ptr_list && (t == GGML_TYPE_IQ3_XXS || t == GGML_TYPE_Q2_0 || t == GGML_TYPE_IQ4_NL) && p.n > 0 && p.n <= 16) { // FORK Rank-1: bypass gather via blob pointers
+        run_ptr(p, ctx_, d_ptrs_, stream);
+        return;
+    }
     switch (t) {
 #ifdef STRATA_ORCA_Q4KS_MMQ
         case GGML_TYPE_Q5_0: mul_mat_q_case<GGML_TYPE_Q5_0>(ctx, a, s); break;
@@ -207,6 +214,10 @@ void Context::run(const Product& p, void* stream) {
             std::exit(1);
     }
     ck(cudaGetLastError(), "mul_mat_q");
+}
+bool ptr_supported(int gu_type, int d_type) { // FORK Rank-1: matches the ptr-path instances in mmq_ptr/
+    const auto t = (ggml_type) gu_type, d = (ggml_type) d_type;
+    return t == GGML_TYPE_IQ3_XXS && (d == GGML_TYPE_Q2_0 || d == GGML_TYPE_IQ4_NL);
 }
 
 void gather_native(const void* gate, const void* up, size_t gu_half_bytes, const void* down, size_t d_bytes,
@@ -233,6 +244,7 @@ bool gather_native_group(const GatherGroup& g, size_t up_off, size_t gu_half_byt
     for (int q = g.first; q < g.n; ++q) a |= (uintptr_t) g.blob[q];
     if (a % 16 != 0) return false;
     GroupArgs ga{};
+    ga.dn_only = g.dn_only;
     for (int q = g.first; q < g.n; ++q) ga.blob[q] = g.blob[q];
     ga.up_off = (int64_t) up_off / 16;
     ga.down_off = (int64_t) down_off / 16;

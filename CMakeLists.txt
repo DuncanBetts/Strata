@@ -1063,6 +1063,19 @@ if(STRATA_NATIVE_EXPERTS)
     foreach(_t IN LISTS _strata_mmq_cuda_types)
       target_sources(strata_mmq PRIVATE ${_strata_mmq}/template-instances/mmq-instance-${_t}.cu)
     endforeach()
+    # FORK (Rank-1, Issue 09), checkpoint 1: one ptr-path template instance
+    # from the vendored slice (src/prefill/mmq_ptr/). Per-source include dir
+    # so ONLY this TU resolves "mmq.cuh" to the wrapped copy; moe_mmq.cu and
+    # the legacy instances keep the _deps header.
+    target_sources(strata_mmq PRIVATE src/prefill/mmq_ptr/mmq-instance-ptr-iq3_xxs.cu)
+    set_source_files_properties(src/prefill/mmq_ptr/mmq-instance-ptr-iq3_xxs.cu PROPERTIES
+      INCLUDE_DIRECTORIES ${CMAKE_CURRENT_SOURCE_DIR}/src/prefill/mmq_ptr)
+    target_sources(strata_mmq PRIVATE src/prefill/mmq_ptr_dispatch.cu)
+    foreach(_pt IN ITEMS q2_0 iq4_nl)
+      target_sources(strata_mmq PRIVATE src/prefill/mmq_ptr/mmq-instance-ptr-${_pt}.cu)
+      set_source_files_properties(src/prefill/mmq_ptr/mmq-instance-ptr-${_pt}.cu PROPERTIES
+        INCLUDE_DIRECTORIES ${CMAKE_CURRENT_SOURCE_DIR}/src/prefill/mmq_ptr)
+    endforeach()
     target_include_directories(strata_mmq PRIVATE ${_strata_gg}/include ${_strata_gg}/src ${_strata_mmq}
                                PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
     target_compile_options(strata_mmq PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--extended-lambda -use_fast_math>)
@@ -1089,6 +1102,11 @@ if(STRATA_NATIVE_EXPERTS)
       target_link_libraries(prefill_fused_iq_test PRIVATE strata_mmq ggml-base ${_strata_gpu_runtime_target})
       add_test(NAME prefill_fused_iq_test COMMAND prefill_fused_iq_test)
       set_tests_properties(prefill_fused_iq_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 600)
+      # FORK (Rank-1, Issue 09): stride-vs-pointer bitwise parity (synthetic IQ3_XXS group, a few seconds)
+      add_executable(prefill_mmq_ptr_test tests/cuda/prefill_mmq_ptr_test.cpp)
+      target_link_libraries(prefill_mmq_ptr_test PRIVATE strata_mmq ggml-base ${_strata_gpu_runtime_target})
+      add_test(NAME prefill_mmq_ptr_test COMMAND prefill_mmq_ptr_test)
+      set_tests_properties(prefill_mmq_ptr_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 300)
     endif()
     if(STRATA_BUILD_TESTS AND STRATA_MMQ_KQUANTS)
       # the UD-Q4_K_XL expert formats through MMQ against ggml's dequantized weights (synthetic, a few seconds)

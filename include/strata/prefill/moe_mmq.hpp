@@ -45,7 +45,18 @@ struct Product {
     int64_t total_rows = 0, max_rows = 0;
     float* dst = nullptr;
     int64_t ld_dst = 0;
+    // FORK (Rank-1, Issue 09): pointer-list experts. When ptr_list, the
+    // launch reads expert e's blob from blobs[e] (+up_off/down_off selected
+    // by the caller per product) instead of w + e * expert_bytes. Stride
+    // path untouched when unset. blobs referenced, never owned.
+    const void* blobs[16] = {};   // == kGatherGroupMax (defined below); literal: Product precedes it
+    size_t up_off = 0, down_off = 0;
+    size_t w_off = 0; // matrix offset within each blob: 0 = gate/up pair, down_off = down (caller-selected)
+    bool ptr_list = false;
 };
+/// FORK (Rank-1): whether a gu/down type pair can run the pointer-list path
+/// (a ptr-path template instance exists for both matrices).
+bool ptr_supported(int gu_type, int d_type);
 
 /// The launch context (llama.cpp's MMQ keeps a small scratch pool for its stream-k fixup).  One per prompt path.
 class Context {
@@ -58,6 +69,7 @@ public:
 
 private:
     void* ctx_ = nullptr;
+    void* d_ptrs_ = nullptr; // FORK Rank-1: device-side blob-pointer table (16 entries) for ptr_list launches
 };
 
 /// A GGUF-native expert (gate at `gate`, up at `up`, down at `down`, each its GGUF rows) into a group buffer's
@@ -71,6 +83,9 @@ constexpr int kGatherGroupMax = 16;
 struct GatherGroup {
     const uint8_t* blob[kGatherGroupMax] = {};
     int first = 0, n = 0;
+    // FORK Rank-1: bit q set = position q copies its down half only (gate/up
+    // read direct via the pointer table, so grp_gu[q] stays stale by design).
+    uint16_t dn_only = 0;
 };
 bool gather_native_group(const GatherGroup& g, size_t up_off, size_t gu_half_bytes, size_t down_off, size_t d_bytes,
                          void* gu_dst, size_t gu_stride, void* d_dst, size_t d_stride, void* stream);

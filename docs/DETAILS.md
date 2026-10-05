@@ -28,6 +28,17 @@ argmax run on thread-block clusters (RTX 50, sm_90+; other cards keep the previo
 IQ3 packs about even); `STRATA_QSA_CLUSTER=0` / `STRATA_ARGMAX_MULTI=0` turn the decode kernels off. The tables
 below are 0.1.26's.
 
+**Pointer-list prompt bypass (opt-in `STRATA_PF_PTR_MMQ=1`, RTX 5090 32 GB,
+16-core CPU, 64 GB RAM, IQ3_XXS pack):** resident experts skip the gate/up
+gather and read direct via a pointer table; down stays gathered. Short prompt
+(42 tokens, x5 interleaved): 275 vs 289 ms prefill (noise, +-10%); medium
+(1,499 tokens, x2): 535 vs 524 ms (about even); long (7,849 tokens, 2 chunks,
+x2): 1,475 vs 1,473 ms (~5,335 tok/s both). Answers bit-identical both ways
+on every run, zero non-finite layers. The skipped traffic is VRAM-to-VRAM
+(residents x 1.25 MB, ~21 GB on the long prompt) but runs overlapped with
+compute here, so it only reaches wall-clock where VRAM bandwidth is narrow;
+kept default-off until slow-link numbers exist.
+
 ### Prompt processing (tokens/s)
 
 | Model | 1K | 4K | 32K | 64K | 128K | 262K |

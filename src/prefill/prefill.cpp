@@ -2460,6 +2460,11 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                 copy_i32(P.src, P.host_src, rows_peer, ps);
                             }
                             const size_t n = order_peer.size();
+                            // FORK Rank-1 checkpoint-4b: pointer-list bypass gate (default off; mirrors local path).
+                            static const bool ptr_env = [] {
+                                const char* v = std::getenv("STRATA_PF_PTR_MMQ");
+                                return v != nullptr && std::atoi(v) != 0;
+                            }();
                             if (P.compact) {
                                 // groups of up to MMQ_GROUP experts and at most G rows, each computed from its own rows
                                 P.groups.clear();
@@ -2493,6 +2498,9 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                 for (size_t g2 = 0; g2 < ng; ++g2) {
                                     const size_t j0 = P.groups[g2].first, j1 = P.groups[g2].second;
                                     const int ngx = (int) (j1 - j0);
+                                    const bool do_ptr = ptr_env && lay.native && mmq::ptr_supported(mmq_gt, mmq_dt) && ngx <= 16;
+                                    const uint8_t* ptr_blob[MMQ_GROUP] = {};
+                                    int psl_of[MMQ_GROUP]; // FORK Rank-1 mixed: ring slot per position (-1 peer-resident)
                                     int64_t maxr = 0;
                                     for (size_t j = j0; j < j1; ++j) {
                                         const int32_t e = order_peer[j];
@@ -2514,12 +2522,16 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                             bd = P.peer->slot_ptr(l, e);
                                         }
                                         const size_t q = j - j0;
-                                        if (lay.native)
-                                            mmq::gather_native(bd, bd + f.up_off, mmq_gub / 2, bd + f.down_off, mmq_db,
-                                                               P.grp_gu + q * mmq_gub, P.grp_d + q * mmq_db, ps);
-                                        else
+                                        ptr_blob[q] = bd; // FORK Rank-1: blob per group slot
+                                        psl_of[q] = psl; // FORK Rank-1 mixed: residency per position
+                                        if (lay.native) {
+                                            if (!do_ptr || psl >= 0) // stride path or peer-ring: full gather
+                                                mmq::gather_native(bd, bd + f.up_off, mmq_gub / 2, bd + f.down_off, mmq_db,
+                                                                   P.grp_gu + q * mmq_gub, P.grp_d + q * mmq_db, ps);
+                                            else cudaMemcpyAsync(P.grp_d + q * mmq_db, bd + f.down_off, mmq_db, cudaMemcpyDeviceToDevice, ps); // peer-resident ptr mode: down half only (gate/up via table)
+                                        } else
                                             mmq::gather_strata_q2(bd, P.grp_gu + q * mmq_gub, P.grp_d + q * mmq_db, ps);
-                                        if (psl >= 0) {   // the slot is free once gathered
+                                        if (psl >= 0) {   // ptr groups: slot frees after the products consume the blobs
                                             cudaEventRecord(P.pused[(size_t) psl], ps);
                                             ++P.pk;
                                             p_issue_until(P.pk + (size_t) P.RP);
@@ -2535,7 +2547,8 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                     gu.w = P.grp_gu; gu.type = mmq_gt; gu.w_rows = 1280; gu.w_cols = N; gu.expert_bytes = mmq_gub;
                                     gu.n = ngx; gu.xq = P.Xq_g; gu.bounds = rel; gu.ids = P.ident;
                                     gu.total_rows = nr; gu.max_rows = maxr; gu.dst = P.GU_g; gu.ld_dst = 1280;
-                                    P.run_ctx->run(gu, ps);
+                                    if (do_ptr) { for (int i = 0; i < ngx; ++i) { gu.blobs[i] = psl_of[i] < 0 ? ptr_blob[i] : P.grp_gu + (size_t) i * mmq_gub; } gu.ptr_list = true; gu.w_off = 0; }
+                                    P.run_ctx->run(gu, ps); // 4b-repair: the launch was dropped; stride path needs it
                                     mmq::swiglu(P.GU_g, P.H_g, nr, 640, !lay.native, ps);
                                     mmq::quantize(P.H_g, nullptr, P.Hq_g, mmq_dt, 640, 640, nr, ps);
                                     const int b = (int) (g2 & 1);
@@ -2545,6 +2558,8 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                     dn.n = ngx; dn.xq = P.Hq_g; dn.bounds = rel;
                                     dn.ids = P.ident; dn.total_rows = nr; dn.max_rows = maxr; dn.dst = P.Dm_b[b];
                                     dn.ld_dst = N;
+                                    // FORK Rank-1: peer down stays on the gathered stride path (K-tail over-read
+                                    // unsafe via pointers); P.grp_d holds every expert's down half.
                                     P.run_ctx->run(dn, ps);
                                     cudaEventRecord(P.ev_grp[g2 % PeerPrefill::kGrpEv], ps);
                                     cudaStreamWaitEvent(P.s_out, P.ev_grp[g2 % PeerPrefill::kGrpEv], 0);
@@ -2575,14 +2590,21 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                 mmq::quantize(P.mixed, P.src, P.Xq, mmq_gt, N, N, rows_peer, ps);
                                 pe.mark(kPeMoeGemm, ps);
                                 const auto& f = lay.fmt[(size_t) l];
+                                const uint8_t* pblob[MMQ_GROUP] = {};
                                 for (size_t j = 0; j < n; ++j) {
                                     const int32_t e = order_peer[j];
                                     const uint8_t* bd = P.peer->slot_ptr(l, e);
                                     const size_t q = j % MMQ_GROUP;
-                                    if (lay.native)
-                                        mmq::gather_native(bd, bd + f.up_off, mmq_gub / 2, bd + f.down_off, mmq_db,
-                                                           P.grp_gu + q * mmq_gub, P.grp_d + q * mmq_db, ps);
-                                    else
+                                    pblob[q] = bd; // FORK Rank-1: blob per group slot (both modes use it)
+                                    const size_t j0p = j - q;
+                                    const size_t ngxp = std::min<size_t>(MMQ_GROUP, n - j0p);
+                                    const bool do_ptr = ptr_env && lay.native && mmq::ptr_supported(mmq_gt, mmq_dt) && (int) ngxp <= 16;
+                                    if (lay.native) {
+                                        if (!do_ptr)
+                                            mmq::gather_native(bd, bd + f.up_off, mmq_gub / 2, bd + f.down_off, mmq_db,
+                                                               P.grp_gu + q * mmq_gub, P.grp_d + q * mmq_db, ps);
+                                        else cudaMemcpyAsync(P.grp_d + q * mmq_db, bd + f.down_off, mmq_db, cudaMemcpyDeviceToDevice, ps); // ptr mode: down half only (gate/up via table)
+                                    } else
                                         mmq::gather_strata_q2(bd, P.grp_gu + q * mmq_gub, P.grp_d + q * mmq_db, ps);
                                     if (q + 1 < MMQ_GROUP && j + 1 < n) continue;
                                     const size_t j0 = j - q, g2 = j0 / MMQ_GROUP;
@@ -2590,13 +2612,15 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                     const int64_t r0 = P.bounds_host[j0], nr = P.bounds_host[j + 1] - r0;
                                     int64_t maxr = 0;
                                     for (size_t i = j0; i <= j; ++i) maxr = std::max<int64_t>(maxr, m.cnt[(size_t) order_peer[i]]);
+                                    const bool pdo = ptr_env && lay.native && mmq::ptr_supported(mmq_gt, mmq_dt) && ngx <= 16;
                                     cudaMemsetAsync(P.grp_gu + (size_t) ngx * mmq_gub, 0, MMQ_TAIL, ps);
                                     cudaMemsetAsync(P.grp_d + (size_t) ngx * mmq_db, 0, MMQ_TAIL, ps);
                                     mmq::Product gu;
                                     gu.w = P.grp_gu; gu.type = mmq_gt; gu.w_rows = 1280; gu.w_cols = N; gu.expert_bytes = mmq_gub;
                                     gu.n = ngx; gu.xq = P.Xq; gu.bounds = P.bounds + j0; gu.ids = P.ident;
                                     gu.total_rows = rows_peer; gu.max_rows = maxr; gu.dst = P.GU; gu.ld_dst = 1280;
-                                    P.run_ctx->run(gu, ps);
+                                    if (pdo) { for (int i = 0; i < ngx; ++i) gu.blobs[i] = pblob[i]; gu.ptr_list = true; gu.w_off = 0; }
+                                    P.run_ctx->run(gu, ps); // 4b-repair: the launch was dropped; stride path needs it
                                     mmq::swiglu(P.GU + r0 * 1280, P.H + r0 * 640, nr, 640, !lay.native, ps);
                                     mmq::quantize(P.H + r0 * 640, nullptr, P.Hq, mmq_dt, 640, 640, nr, ps);
                                     mmq::Product dn;
@@ -2604,7 +2628,9 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                     dn.n = ngx; dn.xq = P.Hq; dn.bounds = P.bounds + n + 1 + g2 * (MMQ_GROUP + 1);
                                     dn.ids = P.ident; dn.total_rows = nr; dn.max_rows = maxr; dn.dst = P.Dm + r0 * N;
                                     dn.ld_dst = N;
-                                    P.run_ctx->run(dn, ps);
+                                    // FORK Rank-1: peer down stays on the gathered stride path (K-tail over-read
+                                    // unsafe via pointers).
+                                    P.run_ctx->run(dn, ps); // 4b-repair: the launch was dropped; stride path needs it
                                     if (P.out_pipe && nr > 0) {   // this group's rows go back while the next group computes
                                         cudaEventRecord(P.ev_grp[g2], ps);
                                         cudaStreamWaitEvent(P.s_out, P.ev_grp[g2], 0);
@@ -2702,6 +2728,16 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         mmq::GatherGroup gg;
                         int gg_slots[MMQ_GROUP];
                         int gg_nslots = 0;   // ring slots gathered by the next flush
+                        // FORK Rank-1: pointer-list bypass (STRATA_PF_PTR_MMQ=1, default off). Blob per group slot,
+                        // deferred ring-slot release (slots free after the products consume the blobs, not the
+                        // gather), and do_ptr (this group skips gather; read by flush() below, set per group).
+                        static const bool ptr_env = [] {
+                            const char* v = std::getenv("STRATA_PF_PTR_MMQ");
+                            return v != nullptr && std::atoi(v) != 0;
+                        }();
+                        const uint8_t* ptr_blob[MMQ_GROUP] = {};
+                        int slot_of[MMQ_GROUP]; // FORK Rank-1: ring slot per group position (-1 resident); drives per-expert gather skip
+                        bool do_ptr = false;
                         auto flush = [&]() {
                             if (gg.n <= gg.first) return;
                             const auto& f = lay.fmt[(size_t) l];
@@ -2710,6 +2746,8 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                 cudaStreamWaitEvent(m.cs, m.copied[gg_slots[gg_nslots - 1]], 0);
                                 pt.mark(kPfDequant, cs);
                             }
+                            if (!do_ptr) {
+                            gg.dn_only = 0; // stride path needs every expert's gate/up gathered
                             if (!mmq::gather_native_group(gg, f.up_off, mmq_gub / 2, f.down_off, mmq_db, m.grp_gu, mmq_gub,
                                                           m.grp_d, mmq_db, m.cs)) {
                                 for (int i = gg.first; i < gg.n; ++i) {   // not 16-byte aligned: one at a time
@@ -2717,6 +2755,22 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                     mmq::gather_native(b, b + f.up_off, mmq_gub / 2, b + f.down_off, mmq_db,
                                                        m.grp_gu + i * mmq_gub, m.grp_d + i * mmq_db, m.cs);
                                 }
+                            }
+                            } else {
+                            // FORK Rank-1 mixed: gate/up via the table (2560 % 256 == 0: no K-tail read), so only
+                            // ring experts gather gate/up; down stays on the gathered stride path (its 640-wide
+                            // rows over-read 72 B past the matrix end, which is only safe in a gathered buffer),
+                            // so every expert's down half lands in grp_d. One batched launch (residents copy
+                            // dn-only via gg.dn_only); per-expert fallback when unaligned.
+                            if (!mmq::gather_native_group(gg, f.up_off, mmq_gub / 2, f.down_off, mmq_db, m.grp_gu, mmq_gub,
+                                                          m.grp_d, mmq_db, m.cs)) {
+                                for (int i = gg.first; i < gg.n; ++i) {
+                                    const uint8_t* b = gg.blob[i];
+                                    if (slot_of[i] < 0) { cudaMemcpyAsync(m.grp_d + (size_t) i * mmq_db, b + f.down_off, mmq_db, cudaMemcpyDeviceToDevice, m.cs); continue; }
+                                    mmq::gather_native(b, b + f.up_off, mmq_gub / 2, b + f.down_off, mmq_db,
+                                                       m.grp_gu + i * mmq_gub, m.grp_d + i * mmq_db, m.cs);
+                                }
+                            }
                             }
                             if (gg_nslots > 0) {
                                 const int rel = gg_slots[gg_nslots - 1];
@@ -2736,15 +2790,25 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                 const size_t q = j % MMQ_GROUP;
                                 if (group_gather) {
                                     gg.blob[q] = blob_dev;
+                                    ptr_blob[q] = blob_dev; // FORK Rank-1: blob per group slot (both modes use it)
+                                    slot_of[q] = slot; // FORK Rank-1 mixed: residency per position (flush skips resident gathers)
+                                    if (slot < 0) gg.dn_only |= (uint16_t) (1u << q); else gg.dn_only &= (uint16_t) ~(1u << q); // batched gather copies dn half only here
                                     gg.n = (int) q + 1;
                                     if (slot >= 0) gg_slots[gg_nslots++] = slot;
                                     if (q + 1 < MMQ_GROUP && j + 1 < order.size()) return true;
+                                    do_ptr = ptr_env && lay.native && mmq::ptr_supported(mmq_gt, mmq_dt);
                                     flush();
                                     gg = mmq::GatherGroup{};
                                 } else if (lay.native) {
                                     const auto& f = lay.fmt[(size_t) l];
+                                    const size_t ngx_f = (q + 1 < MMQ_GROUP && j + 1 < order.size()) ? MMQ_GROUP : q + 1;
+                                    do_ptr = ptr_env && mmq::ptr_supported(mmq_gt, mmq_dt) && (int) ngx_f <= 16;
+                                    if (!do_ptr || slot >= 0) // stride path or ring expert: full gather
                                     mmq::gather_native(blob_dev, blob_dev + f.up_off, mmq_gub / 2, blob_dev + f.down_off,
                                                        mmq_db, m.grp_gu + q * mmq_gub, m.grp_d + q * mmq_db, m.cs);
+                                    else cudaMemcpyAsync(m.grp_d + q * mmq_db, blob_dev + f.down_off, mmq_db, cudaMemcpyDeviceToDevice, m.cs); // resident ptr mode: down half only (gate/up via table)
+                                    ptr_blob[q] = blob_dev;
+                                    slot_of[q] = slot;
                                 } else {
                                     mmq::gather_strata_q2(blob_dev, m.grp_gu + q * mmq_gub, m.grp_d + q * mmq_db, m.cs);
                                 }
@@ -2757,13 +2821,14 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                 int64_t maxr = 0;
                                 for (size_t i = j0; i <= j; ++i) maxr = std::max<int64_t>(maxr, m.cnt[(size_t) order[i]]);
                                 pt.mark(kPfGemmGU, cs);
-                                // the zeroed tail after the group's last expert (see MMQ_TAIL)
+                                // the zeroed tail after the group's last expert (see MMQ_TAIL; always kept: over-reads must meet zeros)
                                 cudaMemsetAsync(m.grp_gu + (size_t) ngx * mmq_gub, 0, MMQ_TAIL, m.cs);
                                 cudaMemsetAsync(m.grp_d + (size_t) ngx * mmq_db, 0, MMQ_TAIL, m.cs);
                                 mmq::Product gu;
                                 gu.w = m.grp_gu; gu.type = mmq_gt; gu.w_rows = 1280; gu.w_cols = N; gu.expert_bytes = mmq_gub;
                                 gu.n = ngx; gu.xq = m.Xq; gu.bounds = m.bounds_dev + j0; gu.ids = m.ids_identity;
                                 gu.total_rows = T * K; gu.max_rows = maxr; gu.dst = m.GU; gu.ld_dst = 1280;
+                                if (do_ptr) { for (int i = 0; i < ngx; ++i) { gu.blobs[i] = slot_of[i] < 0 ? ptr_blob[i] : m.grp_gu + (size_t) i * mmq_gub; } gu.ptr_list = true; gu.w_off = 0; }
                                 m.mmq_ctx->run(gu, m.cs);
                                 mmq::swiglu(m.GU + r0 * 1280, m.H + r0 * 640, nr, 640, !lay.native, m.cs);
                                 pt.mark(kPfGemmD, cs);
@@ -2773,6 +2838,8 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                 dn.n = ngx; dn.xq = m.Hq; dn.bounds = m.bounds_dev + n + 1 + g * (MMQ_GROUP + 1);
                                 dn.ids = m.ids_identity; dn.total_rows = nr; dn.max_rows = maxr; dn.dst = m.Dm + r0 * N;
                                 dn.ld_dst = N;
+                                // FORK Rank-1: down stays on the gathered stride path (K-tail over-read unsafe via
+                                // pointers); grp_d holds every expert's down half (residents: memcpy'd above).
                                 m.mmq_ctx->run(dn, m.cs);
                                 return true;
                             }
@@ -2864,17 +2931,19 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     // debug: STRATA_DBG_NAN=1 reports the first layer of a chunk whose MoE produced non-finite values
                     if (static const bool dbg = std::getenv("STRATA_DBG_NAN") != nullptr; dbg) {
                         cudaStreamSynchronize(m.cs);
-                        auto bad = [&](const float* d, int64_t n) {
+                        auto bad = [&](const float* d, int64_t n, int64_t* first) {
                             std::vector<float> h((size_t) n);
                             cudaMemcpy(h.data(), d, (size_t) n * 4, cudaMemcpyDeviceToHost);
                             int64_t c = 0;
-                            for (float v : h) c += !std::isfinite(v);
+                            for (int64_t i = 0; i < n; ++i)
+                                if (!std::isfinite(h[(size_t) i])) { if (!c) *first = i; ++c; }
                             return c;
                         };
                         // (fused: GU and H hold the grouping tables and int8 rows, not floats)
-                        const int64_t bgu = fused_l ? 0 : bad(m.GU, T * K * 1280), bdm = bad(m.Dm, T * K * N),
-                                      bbo = bad(m.bo, T * N);
-                        const int64_t bh = m.H && !fused_l ? bad(m.H, T * K * 640) : -1;
+                        int64_t fgu = -1, fdm = -1, fbo = -1, fh = -1;
+                        const int64_t bgu = fused_l ? 0 : bad(m.GU, T * K * 1280, &fgu), bdm = bad(m.Dm, T * K * N, &fdm),
+                                      bbo = bad(m.bo, T * N, &fbo);
+                        const int64_t bh = m.H && !fused_l ? bad(m.H, T * K * 640, &fh) : -1;
                         static int64_t reported = -1;
                         if ((bgu || bdm || bbo || bh > 0) && reported != stats_.chunks) {
                             reported = stats_.chunks;
@@ -2882,6 +2951,10 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                          "H %lld Dm %lld bo %lld of T %lld\n", (long long) l, (int) use_mmq, mmq_gt, mmq_dt,
                                          n_order, (long long) bgu, (long long) bh, (long long) bdm, (long long) bbo,
                                          (long long) T);
+                            if (bgu) std::fprintf(stderr, "strata dbg: first GU row %lld col %lld\n", fgu / 1280, fgu % 1280);
+                            if (bh > 0) std::fprintf(stderr, "strata dbg: first H row %lld col %lld\n", fh / 640, fh % 640);
+                            if (bdm) std::fprintf(stderr, "strata dbg: first Dm row %lld col %lld\n", fdm / (int64_t) N, fdm % (int64_t) N);
+                            if (bbo) std::fprintf(stderr, "strata dbg: first bo row %lld col %lld\n", fbo / (int64_t) N, fbo % (int64_t) N);
                         }
                     }
                 }

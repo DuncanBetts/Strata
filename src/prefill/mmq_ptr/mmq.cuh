@@ -1,10 +1,10 @@
-// FORK (Rank-1, Issue 09): vendored slice of llama.cpp ggml-cuda MMQ, pin
+// vendored slice of llama.cpp ggml-cuda MMQ, pin
 // 3cf03257 (2026-09-20; see third_party/ggml/VERSION.txt), MIT (C) ggml
 // authors. Copies of mmq-load-tiles.cuh + mmq-vec-dot.cuh sit beside it.
 // Everything below the includes is namespace-wrapped (strata::mmq_ptr) so
 // the ptr-path template instances don't collide with the legacy ones.
-// Pin-update: re-copy the 3 files, re-apply the wrap + the 3-site loader
-// patch (Issue 09).
+// Pin-update: re-copy the 3 files, re-apply the namespace wrap + the
+// per-expert blob-base loader change at the 3 tile call sites.
 #pragma once
 
 #include "common.cuh"
@@ -1060,7 +1060,7 @@ static __global__ void mul_mat_q(
         const int tile_y_max_j = col_diff - jt*J - 1;
 
         const int offset_x = fastdiv(wt, sample_ratio)*stride_sample_x + fastdiv(zt, channel_ratio)*stride_channel_x + it*I*stride_row_x;
-        const int ch_x = fastdiv(zt, channel_ratio); // FORK Rank-1: expert index for pointer-list
+        const int ch_x = fastdiv(zt, channel_ratio); // ptr-list: expert index for pointer-list
         const char * x_eff = use_ptr_list ? x_ptrs[ch_x] : x;
 
         constexpr bool fixup = false;
@@ -1156,7 +1156,7 @@ static __global__ void mul_mat_q(
         const int tile_y_max_j = col_diff - jt*J - 1;
 
         const int offset_x = fastdiv(wt, sample_ratio)*stride_sample_x + fastdiv(zt, channel_ratio)*stride_channel_x + it*I*stride_row_x;
-        const int ch_x = fastdiv(zt, channel_ratio); // FORK Rank-1: expert index for pointer-list
+        const int ch_x = fastdiv(zt, channel_ratio); // ptr-list: expert index for pointer-list
         const char * x_eff = use_ptr_list ? x_ptrs[ch_x] : x;
 
         constexpr bool fixup = false; // All but (potentially) the last iterations write their data to dst rather than the fixup buffer.
@@ -1242,7 +1242,7 @@ static __global__ void mul_mat_q(
     const int tile_y_max_j = col_diff - jt*J - 1;
 
     const int offset_x = fastdiv(wt, sample_ratio)*stride_sample_x + fastdiv(zt, channel_ratio)*stride_channel_x + it*I*stride_row_x;
-    const int ch_x = fastdiv(zt, channel_ratio); // FORK Rank-1: expert index for pointer-list
+    const int ch_x = fastdiv(zt, channel_ratio); // ptr-list: expert index for pointer-list
     const char * x_eff = use_ptr_list ? x_ptrs[ch_x] : x;
 
     constexpr bool fixup = true; // Last index writes its data to fixup buffer to avoid data races with other blocks.
@@ -1398,7 +1398,7 @@ struct mmq_args {
     int64_t nsamples_x; int64_t nsamples_y; int64_t stride_sample_x; int64_t stride_sample_y; int64_t stride_sample_dst;
     int64_t ncols_max;
     int64_t ncols_opt; // value to optimize the tile size against, launch grid still uses ncols_max
-    const char * const * x_channel_ptrs; int use_ptr_list; // FORK Rank-1: per-expert blob bases; stride path when 0
+    const char * const * x_channel_ptrs; int use_ptr_list; // ptr-list: per-expert blob bases; stride path when 0
 };
 
 static size_t mmq_get_nbytes_shared(const ggml_cuda_mmq_config & config, const int cc) {

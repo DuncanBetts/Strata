@@ -1,8 +1,8 @@
-// FORK (Rank-1, Issue 09): ptr-list dispatch TU. Includes ONLY the vendored
+// ptr-list dispatch TU. Includes ONLY the vendored
 // namespaced slice ("mmq_ptr/mmq.cuh") — never the legacy "mmq.cuh", whose
 // file-scope defs would collide (it is compiled separately in moe_mmq.cu).
-// Checkpoint 3: IQ3_XXS only (the sole ptr-path instance); ptr_list with any
-// other type is a caller bug and aborts.
+// One ptr-path template instance per covered type (see mmq-instance-ptr-*.cu);
+// ptr_list with any other type is a caller bug and aborts.
 #include "strata/prefill/moe_mmq.hpp"
 
 #include "common.cuh"

@@ -2460,7 +2460,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                 copy_i32(P.src, P.host_src, rows_peer, ps);
                             }
                             const size_t n = order_peer.size();
-                            // FORK Rank-1 checkpoint-4b: pointer-list bypass gate (default off; mirrors local path).
+                            // Pointer-list bypass gate (default off; mirrors local path).
                             static const bool ptr_env = [] {
                                 const char* v = std::getenv("STRATA_PF_PTR_MMQ");
                                 return v != nullptr && std::atoi(v) != 0;
@@ -2500,7 +2500,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                     const int ngx = (int) (j1 - j0);
                                     const bool do_ptr = ptr_env && lay.native && mmq::ptr_supported(mmq_gt, mmq_dt) && ngx <= 16;
                                     const uint8_t* ptr_blob[MMQ_GROUP] = {};
-                                    int psl_of[MMQ_GROUP]; // FORK Rank-1 mixed: ring slot per position (-1 peer-resident)
+                                    int psl_of[MMQ_GROUP]; // ptr-list, mixed resident/ring: ring slot per position (-1 peer-resident)
                                     int64_t maxr = 0;
                                     for (size_t j = j0; j < j1; ++j) {
                                         const int32_t e = order_peer[j];
@@ -2522,8 +2522,8 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                             bd = P.peer->slot_ptr(l, e);
                                         }
                                         const size_t q = j - j0;
-                                        ptr_blob[q] = bd; // FORK Rank-1: blob per group slot
-                                        psl_of[q] = psl; // FORK Rank-1 mixed: residency per position
+                                        ptr_blob[q] = bd; // ptr-list: blob per group slot
+                                        psl_of[q] = psl; // ptr-list, mixed resident/ring: residency per position
                                         if (lay.native) {
                                             if (!do_ptr || psl >= 0) // stride path or peer-ring: full gather
                                                 mmq::gather_native(bd, bd + f.up_off, mmq_gub / 2, bd + f.down_off, mmq_db,
@@ -2548,7 +2548,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                     gu.n = ngx; gu.xq = P.Xq_g; gu.bounds = rel; gu.ids = P.ident;
                                     gu.total_rows = nr; gu.max_rows = maxr; gu.dst = P.GU_g; gu.ld_dst = 1280;
                                     if (do_ptr) { for (int i = 0; i < ngx; ++i) { gu.blobs[i] = psl_of[i] < 0 ? ptr_blob[i] : P.grp_gu + (size_t) i * mmq_gub; } gu.ptr_list = true; gu.w_off = 0; }
-                                    P.run_ctx->run(gu, ps); // 4b-repair: the launch was dropped; stride path needs it
+                                    P.run_ctx->run(gu, ps);
                                     mmq::swiglu(P.GU_g, P.H_g, nr, 640, !lay.native, ps);
                                     mmq::quantize(P.H_g, nullptr, P.Hq_g, mmq_dt, 640, 640, nr, ps);
                                     const int b = (int) (g2 & 1);
@@ -2558,7 +2558,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                     dn.n = ngx; dn.xq = P.Hq_g; dn.bounds = rel;
                                     dn.ids = P.ident; dn.total_rows = nr; dn.max_rows = maxr; dn.dst = P.Dm_b[b];
                                     dn.ld_dst = N;
-                                    // FORK Rank-1: peer down stays on the gathered stride path (K-tail over-read
+                                    // ptr-list: peer down stays on the gathered stride path (K-tail over-read
                                     // unsafe via pointers); P.grp_d holds every expert's down half.
                                     P.run_ctx->run(dn, ps);
                                     cudaEventRecord(P.ev_grp[g2 % PeerPrefill::kGrpEv], ps);
@@ -2595,7 +2595,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                     const int32_t e = order_peer[j];
                                     const uint8_t* bd = P.peer->slot_ptr(l, e);
                                     const size_t q = j % MMQ_GROUP;
-                                    pblob[q] = bd; // FORK Rank-1: blob per group slot (both modes use it)
+                                    pblob[q] = bd; // ptr-list: blob per group slot (both modes use it)
                                     const size_t j0p = j - q;
                                     const size_t ngxp = std::min<size_t>(MMQ_GROUP, n - j0p);
                                     const bool do_ptr = ptr_env && lay.native && mmq::ptr_supported(mmq_gt, mmq_dt) && (int) ngxp <= 16;
@@ -2620,7 +2620,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                     gu.n = ngx; gu.xq = P.Xq; gu.bounds = P.bounds + j0; gu.ids = P.ident;
                                     gu.total_rows = rows_peer; gu.max_rows = maxr; gu.dst = P.GU; gu.ld_dst = 1280;
                                     if (pdo) { for (int i = 0; i < ngx; ++i) gu.blobs[i] = pblob[i]; gu.ptr_list = true; gu.w_off = 0; }
-                                    P.run_ctx->run(gu, ps); // 4b-repair: the launch was dropped; stride path needs it
+                                    P.run_ctx->run(gu, ps);
                                     mmq::swiglu(P.GU + r0 * 1280, P.H + r0 * 640, nr, 640, !lay.native, ps);
                                     mmq::quantize(P.H + r0 * 640, nullptr, P.Hq, mmq_dt, 640, 640, nr, ps);
                                     mmq::Product dn;
@@ -2628,9 +2628,9 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                     dn.n = ngx; dn.xq = P.Hq; dn.bounds = P.bounds + n + 1 + g2 * (MMQ_GROUP + 1);
                                     dn.ids = P.ident; dn.total_rows = nr; dn.max_rows = maxr; dn.dst = P.Dm + r0 * N;
                                     dn.ld_dst = N;
-                                    // FORK Rank-1: peer down stays on the gathered stride path (K-tail over-read
+                                    // ptr-list: peer down stays on the gathered stride path (K-tail over-read
                                     // unsafe via pointers).
-                                    P.run_ctx->run(dn, ps); // 4b-repair: the launch was dropped; stride path needs it
+                                    P.run_ctx->run(dn, ps);
                                     if (P.out_pipe && nr > 0) {   // this group's rows go back while the next group computes
                                         cudaEventRecord(P.ev_grp[g2], ps);
                                         cudaStreamWaitEvent(P.s_out, P.ev_grp[g2], 0);
@@ -2728,7 +2728,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         mmq::GatherGroup gg;
                         int gg_slots[MMQ_GROUP];
                         int gg_nslots = 0;   // ring slots gathered by the next flush
-                        // FORK Rank-1: pointer-list bypass (STRATA_PF_PTR_MMQ=1, default off). Blob per group slot,
+                        // ptr-list: pointer-list bypass (STRATA_PF_PTR_MMQ=1, default off). Blob per group slot,
                         // deferred ring-slot release (slots free after the products consume the blobs, not the
                         // gather), and do_ptr (this group skips gather; read by flush() below, set per group).
                         static const bool ptr_env = [] {
@@ -2736,7 +2736,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             return v != nullptr && std::atoi(v) != 0;
                         }();
                         const uint8_t* ptr_blob[MMQ_GROUP] = {};
-                        int slot_of[MMQ_GROUP]; // FORK Rank-1: ring slot per group position (-1 resident); drives per-expert gather skip
+                        int slot_of[MMQ_GROUP]; // ptr-list: ring slot per group position (-1 resident); drives per-expert gather skip
                         bool do_ptr = false;
                         auto flush = [&]() {
                             if (gg.n <= gg.first) return;
@@ -2757,7 +2757,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                 }
                             }
                             } else {
-                            // FORK Rank-1 mixed: gate/up via the table (2560 % 256 == 0: no K-tail read), so only
+                            // ptr-list, mixed resident/ring: gate/up via the table (2560 % 256 == 0: no K-tail read), so only
                             // ring experts gather gate/up; down stays on the gathered stride path (its 640-wide
                             // rows over-read 72 B past the matrix end, which is only safe in a gathered buffer),
                             // so every expert's down half lands in grp_d. One batched launch (residents copy
@@ -2790,8 +2790,8 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                 const size_t q = j % MMQ_GROUP;
                                 if (group_gather) {
                                     gg.blob[q] = blob_dev;
-                                    ptr_blob[q] = blob_dev; // FORK Rank-1: blob per group slot (both modes use it)
-                                    slot_of[q] = slot; // FORK Rank-1 mixed: residency per position (flush skips resident gathers)
+                                    ptr_blob[q] = blob_dev; // ptr-list: blob per group slot (both modes use it)
+                                    slot_of[q] = slot; // ptr-list, mixed resident/ring: residency per position (flush skips resident gathers)
                                     if (slot < 0) gg.dn_only |= (uint16_t) (1u << q); else gg.dn_only &= (uint16_t) ~(1u << q); // batched gather copies dn half only here
                                     gg.n = (int) q + 1;
                                     if (slot >= 0) gg_slots[gg_nslots++] = slot;
@@ -2838,7 +2838,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                 dn.n = ngx; dn.xq = m.Hq; dn.bounds = m.bounds_dev + n + 1 + g * (MMQ_GROUP + 1);
                                 dn.ids = m.ids_identity; dn.total_rows = nr; dn.max_rows = maxr; dn.dst = m.Dm + r0 * N;
                                 dn.ld_dst = N;
-                                // FORK Rank-1: down stays on the gathered stride path (K-tail over-read unsafe via
+                                // ptr-list: down stays on the gathered stride path (K-tail over-read unsafe via
                                 // pointers); grp_d holds every expert's down half (residents: memcpy'd above).
                                 m.mmq_ctx->run(dn, m.cs);
                                 return true;

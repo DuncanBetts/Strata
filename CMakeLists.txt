@@ -1063,8 +1063,8 @@ if(STRATA_NATIVE_EXPERTS)
     foreach(_t IN LISTS _strata_mmq_cuda_types)
       target_sources(strata_mmq PRIVATE ${_strata_mmq}/template-instances/mmq-instance-${_t}.cu)
     endforeach()
-    # FORK (Rank-1, Issue 09), checkpoint 1: one ptr-path template instance
-    # from the vendored slice (src/prefill/mmq_ptr/). Per-source include dir
+    # One ptr-path template instance per covered type, from the vendored slice
+    # (src/prefill/mmq_ptr/). Per-source include dir
     # so ONLY this TU resolves "mmq.cuh" to the wrapped copy; moe_mmq.cu and
     # the legacy instances keep the _deps header.
     target_sources(strata_mmq PRIVATE src/prefill/mmq_ptr/mmq-instance-ptr-iq3_xxs.cu)
@@ -1102,7 +1102,7 @@ if(STRATA_NATIVE_EXPERTS)
       target_link_libraries(prefill_fused_iq_test PRIVATE strata_mmq ggml-base ${_strata_gpu_runtime_target})
       add_test(NAME prefill_fused_iq_test COMMAND prefill_fused_iq_test)
       set_tests_properties(prefill_fused_iq_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 600)
-      # FORK (Rank-1, Issue 09): stride-vs-pointer bitwise parity (synthetic IQ3_XXS group, a few seconds)
+      # stride-vs-pointer bitwise parity (synthetic IQ3_XXS group, a few seconds)
       add_executable(prefill_mmq_ptr_test tests/cuda/prefill_mmq_ptr_test.cpp)
       target_link_libraries(prefill_mmq_ptr_test PRIVATE strata_mmq ggml-base ${_strata_gpu_runtime_target})
       add_test(NAME prefill_mmq_ptr_test COMMAND prefill_mmq_ptr_test)

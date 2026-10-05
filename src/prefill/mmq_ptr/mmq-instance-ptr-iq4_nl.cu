@@ -1,4 +1,4 @@
-// FORK (Rank-1, Issue 09): ptr-path instance, IQ4_NL down (see
+// ptr-path instance, IQ4_NL down (see
 // mmq-instance-ptr-iq3_xxs.cu for the shape; one TU per type).
 #include "mmq.cuh"
 

@@ -1,4 +1,4 @@
-// prefill_mmq_ptr_test - FORK (Rank-1, Issue 09): stride-vs-pointer parity for
+// prefill_mmq_ptr_test - stride-vs-pointer parity for
 // the vendored MMQ slice. Same weights/activations/routing through (a) the
 // legacy stride path (contiguous group buffer, ptr_list unset) and (b) the
 // ptr path (scattered per-expert blobs + w_off, no gather) must give
@@ -456,7 +456,7 @@ int run_big(ggml_type gt, ggml_type dt, int ragged) {
 }
 // masked group gather: experts 0,2 copy down-half only (dn_only bits), 1,3
 // full. Gu slots of masked experts must stay sentinel; everything else must
-// match per-expert gather_native. Guards the batched Rank-1 gather.
+// match per-expert gather_native. Guards the batched gather.
 int run_groupmask() {
     std::mt19937 rng(6161);
     const ggml_type gt = GGML_TYPE_IQ3_XXS;

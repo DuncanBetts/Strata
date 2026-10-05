@@ -45,7 +45,7 @@ struct Product {
     int64_t total_rows = 0, max_rows = 0;
     float* dst = nullptr;
     int64_t ld_dst = 0;
-    // FORK (Rank-1, Issue 09): pointer-list experts. When ptr_list, the
+    // pointer-list experts. When ptr_list, the
     // launch reads expert e's blob from blobs[e] (+up_off/down_off selected
     // by the caller per product) instead of w + e * expert_bytes. Stride
     // path untouched when unset. blobs referenced, never owned.
@@ -54,7 +54,7 @@ struct Product {
     size_t w_off = 0; // matrix offset within each blob: 0 = gate/up pair, down_off = down (caller-selected)
     bool ptr_list = false;
 };
-/// FORK (Rank-1): whether a gu/down type pair can run the pointer-list path
+/// ptr-list: whether a gu/down type pair can run the pointer-list path
 /// (a ptr-path template instance exists for both matrices).
 bool ptr_supported(int gu_type, int d_type);
 
@@ -69,7 +69,7 @@ public:
 
 private:
     void* ctx_ = nullptr;
-    void* d_ptrs_ = nullptr; // FORK Rank-1: device-side blob-pointer table (16 entries) for ptr_list launches
+    void* d_ptrs_ = nullptr; // ptr-list: device-side blob-pointer table (16 entries) for ptr_list launches
 };
 
 /// A GGUF-native expert (gate at `gate`, up at `up`, down at `down`, each its GGUF rows) into a group buffer's
@@ -83,7 +83,7 @@ constexpr int kGatherGroupMax = 16;
 struct GatherGroup {
     const uint8_t* blob[kGatherGroupMax] = {};
     int first = 0, n = 0;
-    // FORK Rank-1: bit q set = position q copies its down half only (gate/up
+    // ptr-list: bit q set = position q copies its down half only (gate/up
     // read direct via the pointer table, so grp_gu[q] stays stale by design).
     uint16_t dn_only = 0;
 };

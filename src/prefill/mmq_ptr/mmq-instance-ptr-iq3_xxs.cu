@@ -1,7 +1,5 @@
-// FORK (Rank-1, Issue 09), checkpoint 1: proves the vendored slice
-// (src/prefill/mmq_ptr/mmq.cuh, llama.cpp pin 3cf03257, MIT) compiles and
-// links beside the legacy MMQ path. Instantiates ONE pack type; ptr_list is
-// NOT wired yet, so nothing in the engine references these symbols.
+// ptr-path instance, IQ3_XXS gate/up (see mmq.cuh for the slice; one TU per
+// type so only this TU resolves "mmq.cuh" to the wrapped copy).
 #include "mmq.cuh"
 
 namespace strata {

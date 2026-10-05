@@ -1,6 +1,6 @@
-// FORK (Rank-1, Issue 09): vendored copy of llama.cpp ggml-cuda
-// mmq-load-tiles.cuh, pin 3cf03257 (2026-09-20), MIT. Checkpoint 1:
-// identical to upstream; checkpoint 2 applies the 3-site loader patch here.
+// Vendored copy of llama.cpp ggml-cuda mmq-load-tiles.cuh, pin 3cf03257
+// (2026-09-20), MIT. Identical to upstream; carried so the vendored mmq.cuh
+// resolves its sibling includes locally.
 #pragma once
 
 #include "vecdotq.cuh"

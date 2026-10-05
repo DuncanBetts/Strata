@@ -1,6 +1,6 @@
-// FORK (Rank-1, Issue 09): vendored copy of llama.cpp ggml-cuda
-// mmq-vec-dot.cuh, pin 3cf03257 (2026-09-20), MIT. Unmodified; carried so
-// the vendored mmq.cuh resolves its sibling includes locally.
+// Vendored copy of llama.cpp ggml-cuda mmq-vec-dot.cuh, pin 3cf03257
+// (2026-09-20), MIT. Identical to upstream; carried so the vendored mmq.cuh
+// resolves its sibling includes locally.
 #pragma once
 
 #include "vecdotq.cuh"

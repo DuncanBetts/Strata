@@ -11,7 +11,7 @@
 #include <cstdlib>
 
 namespace strata::prefill::mmq {
-void run_ptr(const Product& p, void* backend_ctx, void* d_ptrs, void* stream); // FORK Rank-1 (mmq_ptr_dispatch.cu)
+void run_ptr(const Product& p, void* backend_ctx, void* d_ptrs, void* stream); // defined in mmq_ptr_dispatch.cu
 namespace {
 
 void ck(cudaError_t e, const char* what) {
@@ -34,7 +34,7 @@ __global__ void copy16_kernel(const uint4* __restrict__ a, int64_t na, const uin
 struct GroupArgs {
     const uint8_t* blob[kGatherGroupMax];
     int64_t up_off, down_off, gu_stride, d_stride;   // in uint4
-    uint16_t dn_only; // FORK Rank-1: bit q (absolute group position) = copy q's down half only
+    uint16_t dn_only; // ptr-list: bit q (absolute group position) = copy q's down half only
 };
 __global__ void copy16_group_kernel(GroupArgs ga, int first, int64_t na, int64_t nc, uint4* __restrict__ gu_dst,
                                     uint4* __restrict__ d_dst) {
@@ -172,9 +172,9 @@ Context::Context() {
     int dev = 0;
     cudaGetDevice(&dev);
     ctx_ = new ggml_backend_cuda_context(dev);
-    ck(cudaMalloc(&d_ptrs_, 16 * sizeof(void*)), "ptr table"); // FORK Rank-1: blob-pointer table for ptr_list
+    ck(cudaMalloc(&d_ptrs_, 16 * sizeof(void*)), "ptr table"); // ptr-list: blob-pointer table for ptr_list
 }
-Context::~Context() { delete (ggml_backend_cuda_context*) ctx_; if (d_ptrs_) cudaFree(d_ptrs_); } // FORK Rank-1
+Context::~Context() { delete (ggml_backend_cuda_context*) ctx_; if (d_ptrs_) cudaFree(d_ptrs_); }
 
 void Context::run(const Product& p, void* stream) {
     if (p.n <= 0 || p.max_rows <= 0) return;
@@ -187,7 +187,7 @@ void Context::run(const Product& p, void* stream) {
                         p.max_rows, p.max_rows};
     auto& ctx = *(ggml_backend_cuda_context*) ctx_;
     const cudaStream_t s = (cudaStream_t) stream;
-    if (p.ptr_list && (t == GGML_TYPE_IQ3_XXS || t == GGML_TYPE_Q2_0 || t == GGML_TYPE_IQ4_NL) && p.n > 0 && p.n <= 16) { // FORK Rank-1: bypass gather via blob pointers
+    if (p.ptr_list && (t == GGML_TYPE_IQ3_XXS || t == GGML_TYPE_Q2_0 || t == GGML_TYPE_IQ4_NL) && p.n > 0 && p.n <= 16) { // ptr-list: bypass gather via blob pointers
         run_ptr(p, ctx_, d_ptrs_, stream);
         return;
     }
@@ -215,7 +215,7 @@ void Context::run(const Product& p, void* stream) {
     }
     ck(cudaGetLastError(), "mul_mat_q");
 }
-bool ptr_supported(int gu_type, int d_type) { // FORK Rank-1: matches the ptr-path instances in mmq_ptr/
+bool ptr_supported(int gu_type, int d_type) { // ptr-list: matches the ptr-path instances in mmq_ptr/
     const auto t = (ggml_type) gu_type, d = (ggml_type) d_type;
     return t == GGML_TYPE_IQ3_XXS && (d == GGML_TYPE_Q2_0 || d == GGML_TYPE_IQ4_NL);
 }
